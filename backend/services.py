@@ -6,7 +6,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from .categorization import classify, requires_manual_review, transfer_phones
 from .categories import category_names
@@ -130,7 +130,7 @@ def persist_import(db, doc: Document):
             category, kind = rules.get(rule_key, classify(row["description"], row["amount_minor"], own_phones, bank=provider))
         db.add(Transaction(user_id=doc.user_id, account_id=account.id, document_id=doc.id, fingerprint=fp, occurrence=occurrence, category=category, kind=kind, manual=not individual and rule_key in rules, **row))
         count += 1
-    doc.summary = preview_summary_before_commit(payload, plan, count)
+    doc.summary = {**preview_summary_before_commit(payload, plan, count), "account_ids": [a.id for a in accounts.values()]}
     doc.status = "imported"
     doc.payload = {}
     return doc.summary
@@ -140,11 +140,12 @@ def preview_summary_before_commit(payload, plan, count):
     return {"kind": payload["kind"], "total": len(plan), "added": count, "duplicates": sum(status == "duplicate" for _, _, _, status in plan), "period_start": payload["period_start"], "period_end": payload["period_end"], "snapshots": len(payload["snapshots"])}
 
 
-def transaction_dict(t, account=None):
+def transaction_dict(t, account=None, rules=None):
     result = {k: getattr(t, k) for k in ("id", "account_id", "occurred_at", "posted_at", "amount_minor", "currency", "original_amount_minor", "original_currency", "description", "card_last4", "category", "kind", "manual", "source_page", "review_acknowledged")}
     if account:
         result.update(account_name=account.name, account_last4=account.last4, account_kind=account.kind)
         result["can_remember"] = not requires_manual_review(account.bank, t.description, t.amount_minor)
+        result["has_rule"] = result["can_remember"] and (rules or {}).get((t.description, -1 if t.amount_minor < 0 else 1)) == (t.category, t.kind)
     return result
 
 
@@ -163,35 +164,57 @@ def scoped_accounts(db, user_id, bank=None, include_hidden=False):
     return list(db.scalars(query.order_by(Account.kind, Account.name)))
 
 
-def acknowledge_reviews(db, user_id, bank=None):
-    ids = [a.id for a in scoped_accounts(db, user_id, bank)]
+def acknowledge_reviews(db, user_id, bank=None, account_id=""):
+    ids = [a.id for a in scoped_accounts(db, user_id, bank) if not account_id or a.id == account_id]
     return db.query(Transaction).filter(Transaction.user_id == user_id, Transaction.account_id.in_(ids), Transaction.kind == "review", Transaction.review_acknowledged.is_(False)).update({"review_acknowledged": True}, synchronize_session=False)
 
 
-def dashboard(db, user_id, start, end, bank=None, include_hidden=False):
+def dashboard(db, user_id, start, end, bank=None, include_hidden=False, account_id=""):
     all_accounts = scoped_accounts(db, user_id, include_hidden=True)
     candidates = [a for a in all_accounts if not bank or bank == "all" or (a.institution or "unassigned") == bank]
-    accounts = candidates if include_hidden else [a for a in candidates if not a.is_hidden]
-    account_ids = [a.id for a in accounts]
-    by_id = {a.id: a for a in accounts}
-    snapshots = list(db.scalars(select(Snapshot).where(Snapshot.user_id == user_id).order_by(Snapshot.as_of, Snapshot.id)))
+    available = candidates if include_hidden else [a for a in candidates if not a.is_hidden]
+    accounts = [a for a in available if not account_id or a.id == account_id]
+    ids, by_id = [a.id for a in accounts], {a.id:a for a in accounts}
     grouped = defaultdict(list)
-    for s in snapshots:
-        grouped[s.account_id].append(s)
+    for snapshot in db.scalars(select(Snapshot).where(Snapshot.user_id == user_id, Snapshot.account_id.in_(ids)).order_by(Snapshot.as_of, Snapshot.id)):
+        grouped[snapshot.account_id].append(snapshot)
     account_list = [account_dict(a, grouped[a.id]) for a in accounts]
-    hidden_accounts = [account_dict(a, grouped[a.id]) for a in candidates if a.is_hidden]
-    bank_ids = sorted({a.institution or "unassigned" for a in all_accounts})
-    tx_scope = [Transaction.user_id == user_id, Transaction.account_id.in_(account_ids)]
-    txs = list(db.scalars(select(Transaction).where(*tx_scope, Transaction.occurred_at >= start, Transaction.occurred_at < end + "T99").order_by(Transaction.occurred_at.desc())))
-    rub = [t for t in txs if t.currency == "RUB"]
-    expenses = [t for t in rub if t.kind == "expense" and t.amount_minor < 0]
-    cats, days = Counter(), Counter()
-    for t in expenses:
-        cats[t.category] += -t.amount_minor
-        days[t.occurred_at[:10]] += -t.amount_minor
-    refunds = sum(t.amount_minor for t in rub if t.kind == "refund" and t.amount_minor > 0)
-    monthly = Counter()
-    for t in db.scalars(select(Transaction).where(*tx_scope, Transaction.currency == "RUB", Transaction.kind == "expense", Transaction.amount_minor < 0)):
-        monthly[t.occurred_at[:7]] += -t.amount_minor
-    total = sum(a["amount_minor"] or 0 for a in account_list if a["currency"] == "RUB")
-    return {"expense_categories": category_names(db, user_id), "accounts": account_list, "hidden_accounts": hidden_accounts, "banks": [{"id": k, "name": bank_name(k)} for k in bank_ids], "selected_bank": bank or "all", "total_minor": total, "period": {"start": start, "end": end}, "expenses_minor": sum(-t.amount_minor for t in expenses), "refunds_minor": refunds, "income_minor": sum(t.amount_minor for t in rub if t.kind == "income" and t.amount_minor > 0), "review_count": sum(t.kind == "review" and not t.review_acknowledged for t in txs), "review_total_count": sum(t.kind == "review" for t in txs), "review_out_minor": -sum(t.amount_minor for t in rub if t.kind == "review" and t.amount_minor < 0), "all_review_count": db.query(Transaction).filter(*tx_scope, Transaction.kind == "review", Transaction.review_acknowledged.is_(False)).count(), "transaction_count": len(txs), "expense_count": len(expenses), "categories": [{"name": c, "amount_minor": v} for c, v in cats.most_common()], "daily": [{"date": d, "amount_minor": v} for d, v in sorted(days.items())], "monthly": [{"date": d, "amount_minor": v} for d, v in sorted(monthly.items())[-12:]], "recent": [transaction_dict(t, by_id[t.account_id]) for t in txs[:6]], "largest": [transaction_dict(t, by_id[t.account_id]) for t in sorted(expenses, key=lambda t: t.amount_minor)[:5]], "documents": [{"id": d.id, "filename": d.filename, "status": d.status, "created_at": d.created_at, "summary": d.summary} for d in db.scalars(select(Document).where(Document.user_id == user_id, Document.status == "imported").order_by(Document.created_at.desc()).limit(20))]}
+    hidden_accounts = []
+    for a in candidates:
+        if a.is_hidden:
+            history = list(db.scalars(select(Snapshot).where(Snapshot.user_id == user_id, Snapshot.account_id == a.id).order_by(Snapshot.as_of, Snapshot.id)))
+            hidden_accounts.append(account_dict(a, history))
+    scope = [Transaction.user_id == user_id, Transaction.account_id.in_(ids)]
+    period = [*scope, Transaction.occurred_at >= start, Transaction.occurred_at < end+"T99"]
+    rub = [*period, Transaction.currency == "RUB"]
+    expense = [*scope, Transaction.currency == "RUB", Transaction.kind == "expense", Transaction.amount_minor < 0]
+    def amount(kind, positive=True):
+        return db.scalar(select(func.coalesce(func.sum(Transaction.amount_minor),0)).where(*rub, Transaction.kind == kind, Transaction.amount_minor > 0 if positive else Transaction.amount_minor < 0))
+    cats = list(db.execute(select(Transaction.category, -func.sum(Transaction.amount_minor)).where(*expense, Transaction.occurred_at >= start, Transaction.occurred_at < end+"T99").group_by(Transaction.category).order_by(func.sum(Transaction.amount_minor))))
+    day_col, month_col = func.substr(Transaction.occurred_at,1,10), func.substr(Transaction.occurred_at,1,7)
+    daily = list(db.execute(select(day_col, -func.sum(Transaction.amount_minor)).where(*expense, Transaction.occurred_at >= start, Transaction.occurred_at < end+"T99").group_by(day_col).order_by(day_col)))
+    monthly = list(db.execute(select(month_col, -func.sum(Transaction.amount_minor)).where(*expense, Transaction.occurred_at >= start, Transaction.occurred_at < end+"T99").group_by(month_col).order_by(month_col.desc()).limit(12)))
+    recent = list(db.scalars(select(Transaction).where(*period).order_by(Transaction.occurred_at.desc(), Transaction.id).limit(6)))
+    largest = list(db.scalars(select(Transaction).where(*expense, Transaction.occurred_at >= start, Transaction.occurred_at < end+"T99").order_by(Transaction.amount_minor).limit(5)))
+    def count(*filters):
+        return db.scalar(select(func.count()).select_from(Transaction).where(*filters))
+    from .analytics import coverage_intervals
+    coverage = coverage_intervals(db,user_id,accounts)
+    rules = {(r.description,r.direction):(r.category,r.kind) for r in db.scalars(select(CategoryRule).where(CategoryRule.user_id==user_id))}
+    return {
+        "statement_coverage": {aid:[[a.isoformat(),b.isoformat()] for a,b in spans] for aid,spans in coverage.items()},
+        "expense_categories": category_names(db,user_id), "accounts": account_list, "hidden_accounts": hidden_accounts,
+        "available_accounts": [{"id":a.id,"name":a.name,"last4":a.last4,"kind":a.kind,"currency":a.currency} for a in available],
+        "banks": [{"id":k,"name":bank_name(k)} for k in sorted({a.institution or "unassigned" for a in all_accounts})],
+        "selected_bank": bank or "all", "selected_account": account_id,
+        "total_minor": sum(a["amount_minor"] or 0 for a in account_list if a["currency"]=="RUB"), "period":{"start":start,"end":end},
+        "expenses_minor": sum(v for _,v in cats), "refunds_minor":amount("refund"), "income_minor":amount("income"),
+        "review_count":count(*period,Transaction.kind=="review",Transaction.review_acknowledged.is_(False)),
+        "review_total_count":count(*period,Transaction.kind=="review"), "review_out_minor":-amount("review",False),
+        "all_review_count":count(*scope,Transaction.kind=="review",Transaction.review_acknowledged.is_(False)),
+        "transaction_count":count(*period), "expense_count":count(*expense,Transaction.occurred_at>=start,Transaction.occurred_at<end+"T99"),
+        "categories":[{"name":c,"amount_minor":v} for c,v in cats], "daily":[{"date":d,"amount_minor":v} for d,v in daily],
+        "monthly":[{"date":d,"amount_minor":v} for d,v in reversed(monthly)],
+        "recent":[transaction_dict(t,by_id[t.account_id],rules) for t in recent], "largest":[transaction_dict(t,by_id[t.account_id],rules) for t in largest],
+        "documents":[{"id":d.id,"filename":d.filename,"status":d.status,"created_at":d.created_at,"summary":d.summary} for d in db.scalars(select(Document).where(Document.user_id==user_id,Document.status=="imported").order_by(Document.created_at.desc()).limit(20))]
+    }

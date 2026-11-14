@@ -25,6 +25,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import services, snowball
+from .analytics import build_analytics
 from .categories import category_names, normalize_name
 from .categorization import EXPENSE_CATEGORIES, KINDS, requires_manual_review
 from .database import Account, CategoryRule, Document, LoginAttempt, LoginSession, ROOT, Snapshot, Transaction, User, UserCategory, initialize, make_database
@@ -220,7 +221,7 @@ def create_app(database_url=None, production=None):
         return {"ok": True}
 
     @app.get("/api/dashboard")
-    def dashboard(db: DB, uid: UID, start: str = "", end: str = "", bank: str = ""):
+    def dashboard(db: DB, uid: UID, start: str = "", end: str = "", bank: str = "", account_id: str = ""):
         today = date.today()
         start = start or today.replace(day=1).isoformat()
         end = end or today.isoformat()
@@ -230,7 +231,17 @@ def create_app(database_url=None, production=None):
                 raise ValueError()
         except ValueError:
             raise HTTPException(422, "Проверьте период.")
-        return services.dashboard(db, uid, start, end, bank=bank)
+        return services.dashboard(db, uid, start, end, bank=bank, account_id=account_id)
+
+    @app.get("/api/analytics")
+    def analytics(db: DB, uid: UID, start: str, end: str, bank: str = "", account_id: str = "", bucket: str = "month"):
+        try:
+            a, b = date.fromisoformat(start), date.fromisoformat(end)
+            if a > b or a.year < 1900 or b.year > 2200 or bucket not in {"day", "week", "month"}:
+                raise ValueError()
+        except ValueError:
+            raise HTTPException(422, "Проверьте период и группировку аналитики.")
+        return build_analytics(db, uid, a, b, bank=bank, account_id=account_id, bucket=bucket)
 
     @app.get("/api/categories")
     def categories(db: DB, uid: UID):
@@ -267,11 +278,12 @@ def create_app(database_url=None, production=None):
         total = db.scalar(select(func.count()).select_from(query.subquery()))
         page = min(max(page, 1), max(1, (total + 39) // 40))
         items = db.scalars(query.order_by(Transaction.occurred_at.desc(), Transaction.id).offset((page - 1) * 40).limit(40))
-        return {"items": [services.transaction_dict(t, accounts[t.account_id]) for t in items], "total": total, "page": page, "pages": max(1, (total + 39) // 40)}
+        rules = {(r.description,r.direction):(r.category,r.kind) for r in db.scalars(select(CategoryRule).where(CategoryRule.user_id==uid))}
+        return {"items": [services.transaction_dict(t, accounts[t.account_id], rules) for t in items], "total": total, "page": page, "pages": max(1, (total + 39) // 40)}
 
     @app.post("/api/reviews/acknowledge")
-    def acknowledge_reviews(db: DB, uid: UID, bank: str = ""):
-        count = services.acknowledge_reviews(db, uid, bank)
+    def acknowledge_reviews(db: DB, uid: UID, bank: str = "", account_id: str = ""):
+        count = services.acknowledge_reviews(db, uid, bank, account_id)
         db.commit()
         return {"acknowledged": count}
 
