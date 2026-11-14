@@ -1,0 +1,1 @@
+{"name":"svod-finance","private":true,"type":"module","scripts":{"check":"node --check frontend/app.js && node --check frontend/visuals.js && node --check frontend/demo.js && node --check frontend/sw.js"}}
