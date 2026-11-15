@@ -1,6 +1,6 @@
 export const palette = ['#7c9c76', '#c7b282', '#8ca7ab', '#b19db3', '#a4b68b', '#d0ac8c', '#99aab9', '#c3c8ba', '#a1aaa0'];
 export const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
-export const money = (cents = 0, currency = 'RUB', digits = 2) => new Intl.NumberFormat('ru-RU', {style:'currency', currency, minimumFractionDigits:digits, maximumFractionDigits:digits}).format(cents / 100);
+export const money = (cents = 0, currency = 'RUB', digits = 2) => new Intl.NumberFormat('ru-RU', {style:'currency', currency, minimumFractionDigits:digits, maximumFractionDigits:digits}).format((cents===0?0:cents) / 100);
 export const number = n => new Intl.NumberFormat('ru-RU').format(n);
 export const count = (n, one, few, many) => `${number(n)} ${n%100>=11&&n%100<=19?many:n%10===1?one:n%10>=2&&n%10<=4?few:many}`;
 export const dateText = (value, long = false) => value ? new Date(value.slice(0,10) + 'T12:00:00').toLocaleDateString('ru-RU', {day:'numeric', month:long ? 'long' : 'short', ...(long ? {year:'numeric'} : {})}) : 'Нет данных';
@@ -35,36 +35,4 @@ export const icon = (name, size = 19) => `<svg width="${size}" height="${size}" 
 export const catIcon = t => t.kind === 'transfer' || t.kind === 'review' ? 'transfer' : ({'Продукты':'cart','Кафе и рестораны':'coffee','Транспорт':'transport','Здоровье':'health','Спорт':'sport'}[t.category] || 'card');
 export const colorDot = (color, size=7) => `<svg width="${size}" height="${size}" aria-hidden="true"><circle cx="${size/2}" cy="${size/2}" r="${size/2}" fill="${color}"/></svg>`;
 
-export function barChart(points, label = 'Расходы') {
-  if (!points.length || !points.some(p => p.amount_minor)) return '';
-  const W=680,H=228,L=55,R=15,T=12,B=34, width=W-L-R, height=H-T-B;
-  const max=Math.max(...points.map(p=>p.amount_minor))*1.15;
-  const step=width/points.length, bw=Math.min(step*.57,30);
-  const grids=[0,.5,1].map(r=>{const y=T+height*(1-r);return `<line class="gridline" x1="${L}" x2="${W-R}" y1="${y}" y2="${y}"/><text x="${L-10}" y="${y+4}" text-anchor="end">${number(Math.round(max*r/100000))} тыс.</text>`;}).join('');
-  const bars=points.map((p,i)=>{const h=Math.max(0,height*p.amount_minor/max),x=L+i*step+(step-bw)/2,y=T+height-h;return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="3" fill="${i===points.length-1 ? '#174d43' : '#a8bd95'}"><title>${esc(p.label)}: ${esc(money(p.amount_minor))}</title></rect>`;}).join('');
-  const every=Math.max(1,Math.ceil(points.length/8));
-  const labels=points.map((p,i)=>i%every===0 || i===points.length-1 ? `<text x="${L+(i+.5)*step}" y="${H-9}" text-anchor="middle">${esc(p.label)}</text>`:'').join('');
-  return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="${esc(label)}">${grids}${bars}${labels}</svg>`;
-}
-
-export function historyChart(history) {
-  if (!history.length) return '';
-  const byDay = new Map(); history.forEach(p=>byDay.set(p.date.slice(0,10),p));
-  const points=[...byDay.values()].sort((a,b)=>a.date.localeCompare(b.date));
-  const W=680,H=215,L=65,R=25,T=22,B=35;
-  let low=Math.min(...points.map(p=>p.amount_minor)),high=Math.max(...points.map(p=>p.amount_minor));
-  const pad=Math.max((high-low)*.2,high*.025,10000);low-=pad;high+=pad;
-  const first=Date.parse(points[0].date.slice(0,10)),last=Date.parse(points.at(-1).date.slice(0,10));
-  const xy=points.map(p=>[points.length===1 ? (W+L-R)/2 : L+(W-L-R)*(Date.parse(p.date.slice(0,10))-first)/(last-first || 1),T+(H-T-B)*(1-(p.amount_minor-low)/(high-low))]);
-  const grids=[0,.5,1].map(r=>{let y=T+(H-T-B)*(1-r);return `<line class="gridline" x1="${L}" x2="${W-R}" y1="${y}" y2="${y}"/><text x="${L-10}" y="${y+4}" text-anchor="end">${number(Math.round((low+(high-low)*r)/100000))} тыс.</text>`;}).join('');
-  const line=points.length>1 ? `<path d="${xy.map(([x,y],i)=>`${i?'L':'M'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ')}" stroke="#708e68" stroke-width="2.5" fill="none"/>`:'';
-  const every=Math.max(1,Math.ceil(points.length/5));
-  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="История снимков остатка">${grids}${line}${xy.map(([x,y],i)=>`<circle cx="${x}" cy="${y}" r="${points.length===1?6:3.5}" fill="#174d43"><title>${esc(dateText(points[i].date,true))}: ${esc(money(points[i].amount_minor))}</title></circle>${i%every===0 || i===points.length-1 ? `<text x="${x}" y="${H-8}" text-anchor="middle">${esc(dateText(points[i].date))}</text>`:''}`).join('')}</svg>`;
-}
-
-export function donutChart(categories) {
-  const total=categories.reduce((s,c)=>s+c.amount_minor,0),r=57,circ=2*Math.PI*r;
-  let offset=0;
-  const arcs=categories.map((c,i)=>{const len=c.amount_minor/total*circ;const svg=`<circle cx="80" cy="80" r="${r}" fill="none" stroke="${palette[i%palette.length]}" stroke-width="15" stroke-dasharray="${Math.max(0,len-2)} ${circ-Math.max(0,len-2)}" stroke-dashoffset="${-offset}" transform="rotate(-90 80 80)"><title>${esc(c.name)}: ${esc(money(c.amount_minor))}</title></circle>`;offset+=len;return svg;}).join('');
-  return `<svg class="donut" viewBox="0 0 160 160" role="img" aria-label="Распределение расходов по категориям">${arcs}<text x="80" y="77" font-size="24" font-weight="500">${Math.round(total/100000)}</text><text x="80" y="96" font-size="10" fill="#8c9588">тыс. рублей</text></svg>`;
-}
+export {barChart, historyChart, donutChart} from './charts.js';

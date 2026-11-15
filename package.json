@@ -1,1 +1,12 @@
-{"name":"svod-finance","private":true,"type":"module","scripts":{"check":"node --check frontend/app.js && node --check frontend/visuals.js && node --check frontend/demo.js && node --check frontend/sw.js"}}
+{
+  "name": "svod-finance",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check frontend/app.js && node --check frontend/visuals.js && node --check frontend/charts.js && node --check frontend/analytics.js && node --check frontend/demo.js && node --check frontend/sw.js",
+    "test:ui": "node --test tests/ui.test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}
